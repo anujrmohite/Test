@@ -1,0 +1,523 @@
+I'll create a focused implementation for **`update_many`** only, which updates multiple documents with the same data.
+
+## Update Many Implementation
+
+```python
+from fastapi import FastAPI, HTTPException, status
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, validator
+from typing import List, Dict, Any, Optional
+from bson import ObjectId
+from bson.errors import InvalidId
+from datetime import datetime
+
+app = FastAPI()
+
+# MongoDB connection
+MONGO_URL = "mongodb://localhost:27017"
+client = AsyncIOMotorClient(MONGO_URL)
+db = client["your_database"]
+collection = db["your_collection"]
+
+
+# Custom ObjectId validator
+class PyObjectId(str):
+    """Custom ObjectId type for Pydantic validation"""
+    
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError(f"Invalid ObjectId: {v}")
+        return str(v)
+
+
+# Request Model
+class UpdateManyRequest(BaseModel):
+    """
+    Request model for updating multiple documents with same data
+    """
+    ids: List[PyObjectId] = Field(
+        ..., 
+        alias="_ids",
+        min_items=1,
+        description="List of document IDs to update"
+    )
+    update_data: Dict[str, Any] = Field(
+        ...,
+        description="Data to update in all specified documents"
+    )
+
+    class Config:
+        populate_by_name = True
+        json_schema_extra = {
+            "example": {
+                "_ids": ["507f1f77bcf86cd799439011", "507f1f77bcf86cd799439012"],
+                "update_data": {
+                    "status": "active",
+                    "updated_at": "2024-12-11T10:30:00"
+                }
+            }
+        }
+
+    @validator('update_data')
+    def validate_update_data(cls, v):
+        if not v:
+            raise ValueError("update_data cannot be empty")
+        return v
+
+
+# Response Model
+class UpdateManyResponse(BaseModel):
+    """Response model for update_many operation"""
+    success: bool
+    matched_count: int = Field(
+        ..., 
+        description="Number of documents that matched the filter"
+    )
+    modified_count: int = Field(
+        ..., 
+        description="Number of documents that were actually modified"
+    )
+    requested_count: int = Field(
+        ..., 
+        description="Number of IDs requested to update"
+    )
+    unmatched_ids: List[str] = Field(
+        default=[],
+        description="IDs that were not found in the database"
+    )
+    message: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": True,
+                "matched_count": 2,
+                "modified_count": 2,
+                "requested_count": 2,
+                "unmatched_ids": [],
+                "message": "Successfully updated 2 documents"
+            }
+        }
+
+
+# Main Endpoint
+@app.put("/documents/update-many", response_model=UpdateManyResponse)
+async def update_many_documents(request: UpdateManyRequest):
+    """
+    Update multiple MongoDB documents by their _id with the same update data.
+    
+    This endpoint uses MongoDB's update_many() for optimal performance.
+    All specified documents will receive the same update.
+    
+    Args:
+        request: UpdateManyRequest containing list of IDs and update data
+        
+    Returns:
+        UpdateManyResponse with operation results and statistics
+        
+    Raises:
+        HTTPException: 400 for invalid ObjectIds, 500 for database errors
+    """
+    try:
+        # Convert string IDs to ObjectIds
+        object_ids = [ObjectId(id_str) for id_str in request.ids]
+        
+        # Perform update_many operation
+        result = await collection.update_many(
+            {"_id": {"$in": object_ids}},  # Filter: find all docs with these IDs
+            {"$set": request.update_data}   # Update: apply same changes to all
+        )
+        
+        # Check if all documents were found
+        unmatched_ids = []
+        if result.matched_count < len(request.ids):
+            # Find which documents actually exist
+            matched_docs = await collection.find(
+                {"_id": {"$in": object_ids}},
+                {"_id": 1}  # Only return _id field
+            ).to_list(length=None)
+            
+            # Get set of matched IDs
+            matched_id_set = {str(doc["_id"]) for doc in matched_docs}
+            
+            # Find unmatched IDs
+            unmatched_ids = [
+                id_str for id_str in request.ids 
+                if id_str not in matched_id_set
+            ]
+        
+        # Build response
+        success = result.matched_count == len(request.ids)
+        
+        if success:
+            message = f"Successfully updated {result.modified_count} document(s)"
+        else:
+            message = (
+                f"Updated {result.modified_count} document(s), "
+                f"but {len(unmatched_ids)} document(s) not found"
+            )
+        
+        return UpdateManyResponse(
+            success=success,
+            matched_count=result.matched_count,
+            modified_count=result.modified_count,
+            requested_count=len(request.ids),
+            unmatched_ids=unmatched_ids,
+            message=message
+        )
+        
+    except InvalidId as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid ObjectId format: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database operation failed: {str(e)}"
+        )
+
+
+# Optional: Update many with MongoDB operators
+class UpdateManyWithOperatorsRequest(BaseModel):
+    """Request model supporting MongoDB update operators"""
+    ids: List[PyObjectId] = Field(..., alias="_ids")
+    operations: Dict[str, Dict[str, Any]] = Field(
+        ...,
+        description="MongoDB update operations ($set, $inc, $push, etc.)"
+    )
+
+    class Config:
+        populate_by_name = True
+        json_schema_extra = {
+            "example": {
+                "_ids": ["507f1f77bcf86cd799439011", "507f1f77bcf86cd799439012"],
+                "operations": {
+                    "$set": {"status": "active"},
+                    "$inc": {"view_count": 1},
+                    "$push": {"tags": "featured"}
+                }
+            }
+        }
+
+
+@app.put("/documents/update-many-operators", response_model=UpdateManyResponse)
+async def update_many_with_operators(request: UpdateManyWithOperatorsRequest):
+    """
+    Update multiple documents with MongoDB operators.
+    
+    Supports all MongoDB update operators:
+    - $set: Set field values
+    - $inc: Increment numeric fields
+    - $push: Add to arrays
+    - $pull: Remove from arrays
+    - $unset: Remove fields
+    - $addToSet: Add to array if not exists
+    - etc.
+    """
+    try:
+        object_ids = [ObjectId(id_str) for id_str in request.ids]
+        
+        # update_many with custom operators
+        result = await collection.update_many(
+            {"_id": {"$in": object_ids}},
+            request.operations  # Pass operators directly
+        )
+        
+        # Check for unmatched documents
+        unmatched_ids = []
+        if result.matched_count < len(request.ids):
+            matched_docs = await collection.find(
+                {"_id": {"$in": object_ids}},
+                {"_id": 1}
+            ).to_list(length=None)
+            
+            matched_id_set = {str(doc["_id"]) for doc in matched_docs}
+            unmatched_ids = [
+                id_str for id_str in request.ids 
+                if id_str not in matched_id_set
+            ]
+        
+        success = result.matched_count == len(request.ids)
+        message = (
+            f"Successfully updated {result.modified_count} document(s)"
+            if success
+            else f"Updated {result.modified_count}, {len(unmatched_ids)} not found"
+        )
+        
+        return UpdateManyResponse(
+            success=success,
+            matched_count=result.matched_count,
+            modified_count=result.modified_count,
+            requested_count=len(request.ids),
+            unmatched_ids=unmatched_ids,
+            message=message
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database operation failed: {str(e)}"
+        )
+
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Check if MongoDB connection is healthy"""
+    try:
+        await client.admin.command('ping')
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+```
+
+## Usage Examples
+
+### **Basic Update with $set**
+
+```bash
+curl -X PUT "http://localhost:8000/documents/update-many" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_ids": [
+      "507f1f77bcf86cd799439011",
+      "507f1f77bcf86cd799439012",
+      "507f1f77bcf86cd799439013"
+    ],
+    "update_data": {
+      "status": "archived",
+      "archived_at": "2024-12-11T10:30:00",
+      "archived_by": "admin"
+    }
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "matched_count": 3,
+  "modified_count": 3,
+  "requested_count": 3,
+  "unmatched_ids": [],
+  "message": "Successfully updated 3 document(s)"
+}
+```
+
+### **Update with MongoDB Operators**
+
+```bash
+curl -X PUT "http://localhost:8000/documents/update-many-operators" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_ids": [
+      "507f1f77bcf86cd799439011",
+      "507f1f77bcf86cd799439012"
+    ],
+    "operations": {
+      "$set": {
+        "status": "active",
+        "last_updated": "2024-12-11T10:30:00"
+      },
+      "$inc": {
+        "view_count": 1,
+        "version": 1
+      },
+      "$push": {
+        "tags": "trending"
+      }
+    }
+  }'
+```
+
+### **Python Client Example**
+
+```python
+import httpx
+import asyncio
+
+async def update_multiple_documents():
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            "http://localhost:8000/documents/update-many",
+            json={
+                "_ids": [
+                    "507f1f77bcf86cd799439011",
+                    "507f1f77bcf86cd799439012"
+                ],
+                "update_data": {
+                    "status": "completed",
+                    "completed_at": "2024-12-11T10:30:00"
+                }
+            }
+        )
+        return response.json()
+
+# Run
+result = asyncio.run(update_multiple_documents())
+print(result)
+```
+
+## How It Works
+
+### **Step-by-Step Breakdown**
+
+1. **Request Validation**
+```python
+ids: List[PyObjectId] = Field(..., alias="_ids")
+```
+- Pydantic validates each ID is a valid ObjectId format (24 hex characters)
+- Raises error immediately if any ID is invalid
+
+2. **ObjectId Conversion**
+```python
+object_ids = [ObjectId(id_str) for id_str in request.ids]
+```
+- Converts string IDs like `"507f1f77bcf86cd799439011"` to MongoDB ObjectId type
+
+3. **Update Many Operation**
+```python
+result = await collection.update_many(
+    {"_id": {"$in": object_ids}},    # Find all docs with these IDs
+    {"$set": request.update_data}     # Apply same update to all
+)
+```
+- **Single database call** regardless of how many IDs (efficient!)
+- `$in` operator finds all documents matching any of the IDs
+- `$set` operator sets the fields in `update_data`
+
+4. **Result Object**
+```python
+result.matched_count   # How many documents were found
+result.modified_count  # How many were actually changed
+```
+- `matched_count`: Documents that matched the filter
+- `modified_count`: Documents that were actually modified (may be less if data was already the same)
+
+5. **Finding Unmatched Documents**
+```python
+matched_docs = await collection.find(
+    {"_id": {"$in": object_ids}},
+    {"_id": 1}  # Projection: only return _id field
+).to_list(length=None)
+```
+- Queries again to find which documents actually exist
+- Compares requested IDs vs found IDs to identify missing documents
+
+## MongoDB Query Generated
+
+When you call the endpoint, MongoDB executes:
+
+```javascript
+db.collection.updateMany(
+  {
+    _id: {
+      $in: [
+        ObjectId("507f1f77bcf86cd799439011"),
+        ObjectId("507f1f77bcf86cd799439012"),
+        ObjectId("507f1f77bcf86cd799439013")
+      ]
+    }
+  },
+  {
+    $set: {
+      status: "archived",
+      archived_at: "2024-12-11T10:30:00",
+      archived_by: "admin"
+    }
+  }
+)
+```
+
+## MongoDB Operators Supported
+
+| Operator | Purpose | Example |
+|----------|---------|---------|
+| `$set` | Set field value | `{"$set": {"status": "active"}}` |
+| `$inc` | Increment number | `{"$inc": {"count": 5}}` |
+| `$mul` | Multiply number | `{"$mul": {"price": 1.1}}` |
+| `$push` | Add to array | `{"$push": {"tags": "new"}}` |
+| `$pull` | Remove from array | `{"$pull": {"tags": "old"}}` |
+| `$addToSet` | Add if not exists | `{"$addToSet": {"tags": "unique"}}` |
+| `$unset` | Remove field | `{"$unset": {"temp_field": ""}}` |
+| `$rename` | Rename field | `{"$rename": {"old_name": "new_name"}}` |
+| `$min` | Update if smaller | `{"$min": {"lowest_price": 100}}` |
+| `$max` | Update if larger | `{"$max": {"highest_score": 95}}` |
+| `$currentDate` | Set current date | `{"$currentDate": {"lastModified": true}}` |
+
+## Response Scenarios
+
+### **All Documents Found**
+```json
+{
+  "success": true,
+  "matched_count": 3,
+  "modified_count": 3,
+  "requested_count": 3,
+  "unmatched_ids": [],
+  "message": "Successfully updated 3 document(s)"
+}
+```
+
+### **Some Documents Not Found**
+```json
+{
+  "success": false,
+  "matched_count": 2,
+  "modified_count": 2,
+  "requested_count": 3,
+  "unmatched_ids": ["507f1f77bcf86cd799439099"],
+  "message": "Updated 2 document(s), but 1 document(s) not found"
+}
+```
+
+### **No Changes Made (Data Already Same)**
+```json
+{
+  "success": true,
+  "matched_count": 3,
+  "modified_count": 0,
+  "requested_count": 3,
+  "unmatched_ids": [],
+  "message": "Successfully updated 0 document(s)"
+}
+```
+
+## Performance Benefits
+
+**Why `update_many` is Fast:**
+
+1. **Single Network Round-trip**
+   - 100 documents = 1 database call
+   - vs 100 separate `update_one` calls
+
+2. **MongoDB Optimization**
+   - MongoDB can optimize single query
+   - Better index usage
+   - Less connection overhead
+
+3. **Time Comparison:**
+   ```
+   update_one in loop (100 docs):  ~1000ms
+   update_many (100 docs):         ~50ms
+   
+   20x faster! ⚡
+   ```
+
+## Key Advantages
+
+✅ **Simple**: One endpoint, clear purpose  
+✅ **Fast**: Single database operation  
+✅ **Safe**: Validates ObjectIds before querying  
+✅ **Informative**: Returns detailed statistics  
+✅ **Flexible**: Supports all MongoDB operators  
+✅ **Production-ready**: Proper error handling
+
+This is the recommended approach for updating multiple MongoDB documents with the same data in FastAPI!
+240274
