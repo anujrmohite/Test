@@ -1,0 +1,624 @@
+# Comprehensive Bulk Update Solution
+
+Let me create a robust, production-ready solution that handles all MongoDB data types and operators correctly.
+
+## 1. Core Type System
+
+First, let's define all MongoDB BSON type markers:
+
+```python
+# types.py
+from enum import Enum
+from typing import Set
+
+class BSONTypeMarker(str, Enum):
+    """BSON Extended JSON type markers that need conversion"""
+    OID = "$oid"
+    DATE = "$date"
+    TIMESTAMP = "$timestamp"
+    BINARY = "$binary"
+    REGEX = "$regex"
+    NUMBER_LONG = "$numberLong"
+    NUMBER_DECIMAL = "$numberDecimal"
+    NUMBER_INT = "$numberInt"
+    NUMBER_DOUBLE = "$numberDouble"
+    MIN_KEY = "$minKey"
+    MAX_KEY = "$maxKey"
+    UNDEFINED = "$undefined"
+
+    @classmethod
+    def get_all_markers(cls) -> Set[str]:
+        """Get all BSON type markers"""
+        return {marker.value for marker in cls}
+
+
+class MongoOperator(str, Enum):
+    """MongoDB update operators"""
+    # Field Update Operators
+    SET = "$set"
+    UNSET = "$unset"
+    SET_ON_INSERT = "$setOnInsert"
+    INC = "$inc"
+    MUL = "$mul"
+    MIN = "$min"
+    MAX = "$max"
+    CURRENT_DATE = "$currentDate"
+    RENAME = "$rename"
+    
+    # Array Update Operators
+    PUSH = "$push"
+    PULL = "$pull"
+    ADD_TO_SET = "$addToSet"
+    POP = "$pop"
+    PULL_ALL = "$pullAll"
+    
+    # Array Update Modifiers
+    EACH = "$each"
+    POSITION = "$position"
+    SLICE = "$slice"
+    SORT = "$sort"
+    
+    # Bitwise Operators
+    BIT = "$bit"
+    
+    @classmethod
+    def get_all_operators(cls) -> Set[str]:
+        """Get all MongoDB update operators"""
+        return {op.value for op in cls}
+
+    @classmethod
+    def is_update_operator(cls, key: str) -> bool:
+        """Check if a key is a MongoDB update operator"""
+        return key in cls.get_all_operators()
+
+
+class MongoQueryOperator(str, Enum):
+    """MongoDB query operators for filters"""
+    # Comparison
+    EQ = "$eq"
+    NE = "$ne"
+    GT = "$gt"
+    GTE = "$gte"
+    LT = "$lt"
+    LTE = "$lte"
+    IN = "$in"
+    NIN = "$nin"
+    
+    # Logical
+    AND = "$and"
+    OR = "$or"
+    NOT = "$not"
+    NOR = "$nor"
+    
+    # Element
+    EXISTS = "$exists"
+    TYPE = "$type"
+    
+    # Evaluation
+    REGEX = "$regex"
+    TEXT = "$text"
+    WHERE = "$where"
+    EXPR = "$expr"
+    JSON_SCHEMA = "$jsonSchema"
+    MOD = "$mod"
+    
+    # Array
+    ALL = "$all"
+    ELEM_MATCH = "$elemMatch"
+    SIZE = "$size"
+    
+    # Geospatial
+    GEO_WITHIN = "$geoWithin"
+    GEO_INTERSECTS = "$geoIntersects"
+    NEAR = "$near"
+    NEAR_SPHERE = "$nearSphere"
+    
+    @classmethod
+    def get_all_operators(cls) -> Set[str]:
+        """Get all MongoDB query operators"""
+        return {op.value for op in cls}
+```
+
+## 2. Enhanced Type Normalizer Helper
+
+```python
+# type_utils.py
+from typing import Any, Dict, List, Union
+from bson import ObjectId
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TypeConversionError(Exception):
+    """Raised when type conversion fails"""
+    pass
+
+
+async def convert_special_fields_recursive(
+    data: Union[Dict[str, Any], List[Any], Any],
+    type_normalizer: "TypeNormalizer",
+    collection_name: str,
+    database_name: str,
+    path: str = "root"
+) -> None:
+    """
+    Recursively convert special BSON fields in nested structures.
+    
+    Args:
+        data: The data structure to convert (dict, list, or primitive)
+        type_normalizer: The type normalizer service
+        collection_name: MongoDB collection name
+        database_name: MongoDB database name
+        path: Current path in the data structure (for debugging)
+    """
+    if isinstance(data, dict):
+        # First, convert the current level
+        await type_normalizer.convert_special_fields_in_place(
+            collection_name=collection_name,
+            database_name=database_name,
+            data=data
+        )
+        
+        # Then recursively process nested structures
+        for key, value in list(data.items()):
+            if isinstance(value, (dict, list)):
+                await convert_special_fields_recursive(
+                    data=value,
+                    type_normalizer=type_normalizer,
+                    collection_name=collection_name,
+                    database_name=database_name,
+                    path=f"{path}.{key}"
+                )
+    
+    elif isinstance(data, list):
+        # Process each item in the list
+        for idx, item in enumerate(data):
+            if isinstance(item, (dict, list)):
+                await convert_special_fields_recursive(
+                    data=item,
+                    type_normalizer=type_normalizer,
+                    collection_name=collection_name,
+                    database_name=database_name,
+                    path=f"{path}[{idx}]"
+                )
+
+
+def validate_objectid(oid_str: str) -> bool:
+    """Validate if a string is a valid ObjectId"""
+    try:
+        ObjectId(oid_str)
+        return True
+    except Exception:
+        return False
+
+
+def is_bson_type_marker(key: str) -> bool:
+    """Check if a key is a BSON type marker"""
+    return key in BSONTypeMarker.get_all_markers()
+
+
+def is_mongo_operator(key: str) -> bool:
+    """Check if a key is a MongoDB operator (update or query)"""
+    return (
+        MongoOperator.is_update_operator(key) or
+        key in MongoQueryOperator.get_all_operators()
+    )
+```
+
+## 3. Enhanced Update Document Builder
+
+```python
+# update_builder.py
+from typing import Dict, Any, List, Union
+from fastapi import HTTPException
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class UpdateDocumentBuilder:
+    """Builds MongoDB update documents with proper operator handling"""
+    
+    @staticmethod
+    def is_pipeline_update(data: Any) -> bool:
+        """Check if data represents a pipeline update"""
+        return isinstance(data, list)
+    
+    @staticmethod
+    def is_operator_update(data: Dict[str, Any]) -> bool:
+        """Check if data contains MongoDB update operators"""
+        if not isinstance(data, dict):
+            return False
+        return any(MongoOperator.is_update_operator(key) for key in data.keys())
+    
+    @staticmethod
+    def validate_pipeline_stages(stages: List[Dict[str, Any]]) -> None:
+        """Validate pipeline update stages"""
+        if not stages:
+            raise HTTPException(
+                status_code=400,
+                detail="Pipeline update cannot be empty."
+            )
+        
+        for idx, stage in enumerate(stages):
+            if not isinstance(stage, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pipeline stage at index {idx} must be an object."
+                )
+            
+            # Each stage should have at least one pipeline operator
+            if not any(key.startswith("$") for key in stage.keys()):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pipeline stage at index {idx} must contain at least one pipeline operator."
+                )
+    
+    @staticmethod
+    def validate_update_operators(data: Dict[str, Any]) -> None:
+        """Validate that update operators are used correctly"""
+        for key, value in data.items():
+            if MongoOperator.is_update_operator(key):
+                if not isinstance(value, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Operator '{key}' must have an object value, got {type(value).__name__}."
+                    )
+    
+    @classmethod
+    def build_update_document(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a MongoDB update document from input data.
+        
+        Handles two cases:
+        1. Data with explicit operators ($set, $inc, etc.) - pass through
+        2. Data without operators - wrap in $set
+        
+        Args:
+            data: Input data dictionary
+            
+        Returns:
+            Properly formatted MongoDB update document
+        """
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Update data must be an object."
+            )
+        
+        if not data:
+            raise HTTPException(
+                status_code=400,
+                detail="Update data cannot be empty."
+            )
+        
+        # Case 1: Data already contains operators - validate and pass through
+        if cls.is_operator_update(data):
+            cls.validate_update_operators(data)
+            return data
+        
+        # Case 2: Plain data - wrap in $set
+        # But first, separate any operators that might be mixed in
+        operators: Dict[str, Any] = {}
+        plain_fields: Dict[str, Any] = {}
+        
+        for key, value in data.items():
+            if MongoOperator.is_update_operator(key):
+                # This is an operator
+                if not isinstance(value, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Operator '{key}' must have an object value."
+                    )
+                operators[key] = value
+            elif is_bson_type_marker(key):
+                # This shouldn't happen at top level, but handle it
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"BSON type marker '{key}' cannot be used at document root level."
+                )
+            else:
+                # Regular field
+                plain_fields[key] = value
+        
+        # Build final update document
+        update_doc: Dict[str, Any] = {}
+        
+        if plain_fields:
+            update_doc["$set"] = plain_fields
+        
+        if operators:
+            update_doc.update(operators)
+        
+        return update_doc
+
+
+class FilterValidator:
+    """Validates MongoDB filter documents"""
+    
+    @staticmethod
+    def validate_filter(filter_doc: Dict[str, Any]) -> None:
+        """Validate a MongoDB filter document"""
+        if not isinstance(filter_doc, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Filter must be an object."
+            )
+        
+        if not filter_doc:
+            raise HTTPException(
+                status_code=400,
+                detail="Filter cannot be empty. Each update item must have a non-empty filter."
+            )
+    
+    @staticmethod
+    def validate_objectid_format(filter_doc: Dict[str, Any]) -> None:
+        """Validate ObjectId formats in filter"""
+        def check_nested(obj: Any, path: str = "") -> None:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    current_path = f"{path}.{key}" if path else key
+                    
+                    if key == "$oid":
+                        if not isinstance(value, str):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Invalid $oid format at '{path}': must be a string, got {type(value).__name__}"
+                            )
+                        if not validate_objectid(value):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Invalid ObjectId format at '{path}': {value}"
+                            )
+                    else:
+                        check_nested(value, current_path)
+            
+            elif isinstance(obj, list):
+                for idx, item in enumerate(obj):
+                    check_nested(item, f"{path}[{idx}]")
+        
+        check_nested(filter_doc)
+```
+
+## 4. Complete Bulk Update Implementation
+
+```python
+# bulk_update.py
+from typing import List, Dict, Any, Union
+from fastapi import HTTPException, Depends, APIRouter
+from pydantic import BaseModel, Field, validator
+from pymongo import UpdateOne, WriteConcern
+from pymongo.errors import BulkWriteError, PyMongoError
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Pydantic Models
+# ============================================================================
+
+class BulkUpdateItem(BaseModel):
+    """Single bulk update operation"""
+    filter: Dict[str, Any] = Field(
+        ..., 
+        description="MongoDB filter to select documents for update"
+    )
+    data: Union[Dict[str, Any], List[Dict[str, Any]]] = Field(
+        ..., 
+        description="Update document (with or without operators) or aggregation pipeline"
+    )
+    
+    @validator('filter')
+    def validate_filter_not_empty(cls, v):
+        if not v:
+            raise ValueError("Filter cannot be empty")
+        return v
+    
+    @validator('data')
+    def validate_data_not_empty(cls, v):
+        if isinstance(v, dict) and not v:
+            raise ValueError("Update data cannot be empty")
+        if isinstance(v, list) and not v:
+            raise ValueError("Pipeline cannot be empty")
+        return v
+
+    class Config:
+        schema_extra = {
+            "examples": [
+                {
+                    "filter": {"_id": {"$oid": "507f1f77bcf86cd799439011"}},
+                    "data": {"name": "John", "age": 30}
+                },
+                {
+                    "filter": {"status": "pending"},
+                    "data": {
+                        "$set": {"status": "approved"},
+                        "$inc": {"version": 1},
+                        "$currentDate": {"lastModified": True}
+                    }
+                },
+                {
+                    "filter": {"category": "electronics"},
+                    "data": [
+                        {"$set": {"discount": {"$multiply": ["$price", 0.1]}}},
+                        {"$set": {"discounted": True}}
+                    ]
+                }
+            ]
+        }
+
+
+class BulkUpdateRequest(BaseModel):
+    """Request body for bulk update endpoint"""
+    items: List[BulkUpdateItem] = Field(
+        ...,
+        min_items=1,
+        max_items=1000,  # Reasonable limit
+        description="List of update operations to perform"
+    )
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "items": [
+                    {
+                        "filter": {"_id": {"$oid": "507f1f77bcf86cd799439011"}},
+                        "data": {"name": "Jane Doe", "age": 25}
+                    }
+                ]
+            }
+        }
+
+
+class BulkUpdateResponse(BaseModel):
+    """Response from bulk update operation"""
+    message: str
+    data: Dict[str, Any]
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "message": "Bulk update completed successfully within a transaction.",
+                "data": {
+                    "requested_operations": 2,
+                    "matched_count": 2,
+                    "modified_count": 2,
+                    "upserted_count": 0,
+                    "acknowledged": True,
+                    "details": {}
+                }
+            }
+        }
+
+
+# ============================================================================
+# Main Bulk Update Handler
+# ============================================================================
+
+class BulkUpdateHandler:
+    """Handles bulk update operations with full type conversion support"""
+    
+    def __init__(
+        self,
+        mongo_repository: "MongoRepository",
+        type_normalizer: "TypeNormalizer"
+    ):
+        self.mongo_repository = mongo_repository
+        self.type_normalizer = type_normalizer
+        self.update_builder = UpdateDocumentBuilder()
+        self.filter_validator = FilterValidator()
+    
+    async def process_filter(
+        self, 
+        filter_doc: Dict[str, Any],
+        item_index: int
+    ) -> Dict[str, Any]:
+        """
+        Process and validate a filter document.
+        
+        Args:
+            filter_doc: The filter document to process
+            item_index: Index of the item in the bulk operation (for error messages)
+            
+        Returns:
+            Processed filter document with converted types
+        """
+        try:
+            # Validate filter structure
+            self.filter_validator.validate_filter(filter_doc)
+            
+            # Validate ObjectId formats before conversion
+            self.filter_validator.validate_objectid_format(filter_doc)
+            
+            # Convert special BSON types recursively
+            await convert_special_fields_recursive(
+                data=filter_doc,
+                type_normalizer=self.type_normalizer,
+                collection_name=self.mongo_repository.collection_name,
+                database_name=self.mongo_repository.database_name,
+                path=f"items[{item_index}].filter"
+            )
+            
+            return filter_doc
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error processing filter at index {item_index}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid filter at index {item_index}: {str(e)}"
+            )
+    
+    async def process_pipeline_update(
+        self,
+        pipeline: List[Dict[str, Any]],
+        item_index: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Process an aggregation pipeline update.
+        
+        Args:
+            pipeline: The aggregation pipeline stages
+            item_index: Index of the item in the bulk operation
+            
+        Returns:
+            Processed pipeline with converted types
+        """
+        try:
+            # Validate pipeline structure
+            self.update_builder.validate_pipeline_stages(pipeline)
+            
+            # Convert special fields in each stage
+            for stage_idx, stage in enumerate(pipeline):
+                await convert_special_fields_recursive(
+                    data=stage,
+                    type_normalizer=self.type_normalizer,
+                    collection_name=self.mongo_repository.collection_name,
+                    database_name=self.mongo_repository.database_name,
+                    path=f"items[{item_index}].data[{stage_idx}]"
+                )
+            
+            return pipeline
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error processing pipeline at index {item_index}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid pipeline update at index {item_index}: {str(e)}"
+            )
+    
+    async def process_document_update(
+        self,
+        data: Dict[str, Any],
+        item_index: int
+    ) -> Dict[str, Any]:
+        """
+        Process a document update (with or without operators).
+        
+        Args:
+            data: The update data
+            item_index: Index of the item in the bulk operation
+            
+        Returns:
+            Processed update document with converted types
+        """
+        try:
+            # Build proper update document structure
+            update_doc = self.update_builder.build_update_document(data)
+            
+            # Convert special fields in all operators
+            for operator, operator_value in update_doc.items():
+                if isinstance(operator_value, dict):
+                    await convert_special_fields_recursive(
+                        data=operator_value,
+                        type_normalizer=self.type_normalizer,
+                        collection_name=self.mongo_repository.collection_name,
+                        database_name=self.mongo_repository.database_name,
+                        path=f"items[{item_index}].data.{operator}"
+                    )
+                elif isinstance(operator_value, list):
+                    # Handle operators like $push: {$each: []}
+                    for idx, item in enu
